@@ -45,11 +45,13 @@ struct ReminderItemView: View {
                     reminderNotesText()
                 }
 
-                if !reminderItem.reminder.ekTags.isEmpty {
-                    ReminderTagsView(tagNames: reminderItem.reminder.ekTags.map(\.name))
+                let tagNames = reminderItem.reminder.ekTags.map(\.name)
+                if !tagNames.isEmpty {
+                    ReminderTagsView(tagNames: tagNames)
                 }
 
-                if let dateDescription = reminderItem.reminder.relativeDateDescription {
+                let dateDescription = reminderItem.reminder.relativeDateDescription
+                if let dateDescription {
                     let isUrgent: Bool = {
                         if #available(macOS 26, *) {
                             return reminderItem.reminder.isUrgent
@@ -84,8 +86,7 @@ struct ReminderItemView: View {
                     }
                 }
 
-                let hasDueDate = reminderItem.reminder.relativeDateDescription != nil
-                if showCalendarTitle && !hasDueDate {
+                if showCalendarTitle && dateDescription == nil {
                     HStack {
                         Spacer()
 
