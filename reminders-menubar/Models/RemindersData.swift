@@ -277,13 +277,20 @@ class RemindersData: ObservableObject {
         let calendars = RemindersService.shared.getCalendars()
         let calendarsSet = Set(calendars.map({ $0.calendarIdentifier }))
         self.availableCalendars = calendars
-        self.calendarIdentifiersFilter = self.calendarIdentifiersFilter.filter({ calendarsSet.contains($0) })
+        let validCalendarIdentifiers = self.calendarIdentifiersFilter.filter({ calendarsSet.contains($0) })
+        // Assignment publishes and writes UserDefaults even when the contents did not change.
+        if validCalendarIdentifiers != self.calendarIdentifiersFilter {
+            self.calendarIdentifiersFilter = validCalendarIdentifiers
+        }
         CalendarParser.updateShared(with: calendars)
 
         // Validate filter — remove stale tags that no longer exist
         let tags = await RemindersService.shared.getAllTags()
         self.availableTags = tags
-        self.tagsFilter = self.tagsFilter.filter({ tags.contains($0) })
+        let validTags = self.tagsFilter.filter({ tags.contains($0) })
+        if validTags != self.tagsFilter {
+            self.tagsFilter = validTags
+        }
         TagParser.updateShared(with: tags)
 
         // Fetch reminder data with validated filters
