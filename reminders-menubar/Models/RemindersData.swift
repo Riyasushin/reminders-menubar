@@ -6,6 +6,10 @@ import EventKit
 class RemindersData: ObservableObject {
     private var cancellationTokens: [AnyCancellable] = []
     private let previewService = MenuBarPreviewService()
+    private var incompleteReminders: [EKReminder] = []
+    private var incompleteSnapshotScope: IncompleteCalendarScope?
+    private var isUpdating = false
+    private var updateRequestedWhileBusy = false
 
     init() {
         addObservers()
@@ -20,6 +24,7 @@ class RemindersData: ObservableObject {
         addTagObservers()
         addMenuBarObservers()
         addSearchObservers()
+        addSectionOrderObservers()
     }
 
     private func addDataObservers() {
@@ -39,16 +44,23 @@ class RemindersData: ObservableObject {
         Publishers.MergeMany(
             UserPreferences.shared.$showRemindersWithDueDateOnTop.map { _ in }.eraseToAnyPublisher(),
             UserPreferences.shared.$sortRemindersByFlagAndPriority.map { _ in }.eraseToAnyPublisher(),
-            UserPreferences.shared.$reminderSortingOrder.map { _ in }.eraseToAnyPublisher(),
-            $calendarIdentifiersFilter.removeDuplicates().map { _ in }.eraseToAnyPublisher()
+            UserPreferences.shared.$reminderSortingOrder.map { _ in }.eraseToAnyPublisher()
         )
         .dropFirst()
         .sink { [weak self] _ in
-            Task {
-                await self?.update()
-            }
+            self?.resortLoadedReminders()
         }
         .store(in: &cancellationTokens)
+
+        $calendarIdentifiersFilter
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task {
+                    await self?.update()
+                }
+            }
+            .store(in: &cancellationTokens)
     }
 
     private func addUpcomingObservers() {
@@ -59,8 +71,7 @@ class RemindersData: ObservableObject {
         .dropFirst()
         .sink { [weak self] _ in
             Task {
-                guard let self else { return }
-                self.upcomingReminders = await self.getUpcomingReminders()
+                await self?.reloadDerivedReminders()
             }
         }
         .store(in: &cancellationTokens)
@@ -74,44 +85,25 @@ class RemindersData: ObservableObject {
         .dropFirst()
         .sink { [weak self] _ in
             Task {
-                guard let self else { return }
-                self.filteredTagReminderLists = await self.getTagReminders()
+                await self?.reloadDerivedReminders()
             }
         }
         .store(in: &cancellationTokens)
     }
 
     private func addMenuBarObservers() {
-        UserPreferences.shared.$menuBarCounterType
-            .dropFirst()
-            .sink { [weak self] _ in
-                Task {
-                    guard let self else { return }
-                    self.updateMenuBarCount(to: await self.getMenuBarCount())
-                }
+        Publishers.MergeMany(
+            UserPreferences.shared.$menuBarCounterType.map { _ in }.eraseToAnyPublisher(),
+            UserPreferences.shared.$filterMenuBarContentByCalendar.map { _ in }.eraseToAnyPublisher(),
+            UserPreferences.shared.$menuBarReminderPreviewEnabled.map { _ in }.eraseToAnyPublisher()
+        )
+        .dropFirst()
+        .sink { [weak self] _ in
+            Task {
+                await self?.reloadDerivedReminders()
             }
-            .store(in: &cancellationTokens)
-
-        UserPreferences.shared.$filterMenuBarContentByCalendar
-            .dropFirst()
-            .sink { [weak self] _ in
-                Task {
-                    guard let self else { return }
-                    self.updateMenuBarCount(to: await self.getMenuBarCount())
-                    await self.refreshPreview()
-                }
-            }
-            .store(in: &cancellationTokens)
-
-        UserPreferences.shared.$menuBarReminderPreviewEnabled
-            .dropFirst()
-            .sink { [weak self] _ in
-                Task {
-                    guard let self else { return }
-                    await self.refreshPreview()
-                }
-            }
-            .store(in: &cancellationTokens)
+        }
+        .store(in: &cancellationTokens)
 
         Publishers.MergeMany(
             UserPreferences.shared.$reminderMenuBarIcon.map { _ in }.eraseToAnyPublisher(),
@@ -128,55 +120,88 @@ class RemindersData: ObservableObject {
         $searchText
             .dropFirst()
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
-            .combineLatest($searchableReminders)
-            .sink { [weak self] query, cached in
+            .combineLatest($searchDocuments)
+            .sink { [weak self] query, documents in
                 guard let self else { return }
-                guard showingSearch, !query.isEmpty, let cached else {
+                guard showingSearch, !query.isEmpty, let documents else {
                     searchResults = nil
                     return
                 }
                 searchResults = RemindersService.shared.searchReminders(
                     matching: query,
-                    in: cached
+                    in: documents
                 )
             }
             .store(in: &cancellationTokens)
+    }
+
+    private func addSectionOrderObservers() {
+        Publishers.MergeMany(
+            UserPreferences.shared.$showTagsBeforeCalendars.map { _ in }.eraseToAnyPublisher(),
+            UserPreferences.shared.$showUpcomingReminders.map { _ in }.eraseToAnyPublisher(),
+            UserPreferences.shared.$hideUpcomingRemindersFromLists.map { _ in }.eraseToAnyPublisher()
+        )
+        .dropFirst()
+        .sink { [weak self] _ in
+            self?.cachedOrderedSections = nil
+        }
+        .store(in: &cancellationTokens)
     }
 
     @Published var availableCalendars: [EKCalendar] = []
 
     @Published var availableTags: [Tag] = []
 
-    @Published var upcomingReminders: [ReminderItem] = []
+    @Published var upcomingReminders: [ReminderItem] = [] {
+        didSet { cachedOrderedSections = nil }
+    }
 
-    @Published private var filteredCalendarReminderLists: [CalendarReminderList] = []
+    @Published private var filteredCalendarReminderLists: [CalendarReminderList] = [] {
+        didSet { cachedOrderedSections = nil }
+    }
 
-    @Published private var filteredTagReminderLists: [TagReminderList] = []
+    @Published private var filteredTagReminderLists: [TagReminderList] = [] {
+        didSet { cachedOrderedSections = nil }
+    }
+
+    private var cachedOrderedSections: [ReminderListSection]?
 
     var orderedFilteredSections: [ReminderListSection] {
+        if let cachedOrderedSections {
+            return cachedOrderedSections
+        }
+        let sections = makeOrderedFilteredSections()
+        cachedOrderedSections = sections
+        return sections
+    }
+
+    private func makeOrderedFilteredSections() -> [ReminderListSection] {
         let reminderIdsToExclude = upcomingReminderIdsToExcludeFromLists
-        let calendarSections = filteredCalendarReminderLists.map {
+        let preservesOrder = reminderIdsToExclude.isEmpty
+        let calendarSections = filteredCalendarReminderLists.map { list in
             let exclusionResult = ReminderItemTree.excluding(
                 reminderIds: reminderIdsToExclude,
-                from: $0.reminders
+                from: list.reminders
             )
             return ReminderListSection.calendar(
                 CalendarReminderList(
-                    for: $0.calendar,
-                    with: exclusionResult.reminders
+                    for: list.calendar,
+                    with: exclusionResult.reminders,
+                    preservesOrder: preservesOrder
                 ),
                 hiddenUpcomingReminderCount: exclusionResult.excludedCount
             )
         }
-        let tagSections = filteredTagReminderLists.map {
+        let tagSections = filteredTagReminderLists.map { list in
             let exclusionResult = ReminderItemTree.excluding(
                 reminderIds: reminderIdsToExclude,
-                from: $0.reminders
+                from: list.reminders
             )
             return ReminderListSection.tag(
                 TagReminderList(
-                    for: $0.tag,
-                    with: exclusionResult.reminders
+                    for: list.tag,
+                    with: exclusionResult.reminders,
+                    preservesOrder: preservesOrder
                 ),
                 hiddenUpcomingReminderCount: exclusionResult.excludedCount
             )
@@ -216,12 +241,13 @@ class RemindersData: ObservableObject {
             if showingSearch {
                 showingRecentReminders = false
                 Task {
-                    self.searchableReminders = await RemindersService.shared.fetchAllReminders()
+                    let reminders = await RemindersService.shared.fetchAllReminders()
+                    self.searchDocuments = RemindersService.shared.makeSearchDocuments(from: reminders)
                 }
             } else {
                 searchText = ""
                 searchResults = nil
-                searchableReminders = nil
+                searchDocuments = nil
             }
         }
     }
@@ -230,7 +256,7 @@ class RemindersData: ObservableObject {
 
     @Published var searchResults: [ReminderItem]?
 
-    @Published private var searchableReminders: [EKReminder]?
+    @Published private var searchDocuments: [ReminderSearchDocument]?
 
     @Published var calendarIdentifiersFilter: [String] = {
         guard let identifiers = UserPreferences.shared.preferredCalendarIdentifiersFilter else {
@@ -273,95 +299,230 @@ class RemindersData: ObservableObject {
     }
 
     func update() async {
+        if isUpdating {
+            updateRequestedWhileBusy = true
+            return
+        }
+
+        isUpdating = true
+        await performUpdate()
+        isUpdating = false
+
+        if updateRequestedWhileBusy {
+            updateRequestedWhileBusy = false
+            await update()
+        }
+    }
+
+    private func performUpdate() async {
         // Validate filter — remove stale calendars that no longer exist
         let calendars = RemindersService.shared.getCalendars()
         let calendarsSet = Set(calendars.map({ $0.calendarIdentifier }))
         self.availableCalendars = calendars
-        self.calendarIdentifiersFilter = self.calendarIdentifiersFilter.filter({ calendarsSet.contains($0) })
+        let validCalendarIdentifiers = self.calendarIdentifiersFilter.filter({ calendarsSet.contains($0) })
+        // Assignment publishes and writes UserDefaults even when the contents did not change.
+        if validCalendarIdentifiers != self.calendarIdentifiersFilter {
+            self.calendarIdentifiersFilter = validCalendarIdentifiers
+        }
         CalendarParser.updateShared(with: calendars)
 
-        // Validate filter — remove stale tags that no longer exist
-        let tags = await RemindersService.shared.getAllTags()
+        // One full-catalog read feeds the tag index and, when those views are open, recent/search.
+        let allReminders = await RemindersService.shared.fetchAllReminders()
+        let tags = RemindersService.shared.tags(in: allReminders)
         self.availableTags = tags
-        self.tagsFilter = self.tagsFilter.filter({ tags.contains($0) })
+        let validTags = self.tagsFilter.filter({ tags.contains($0) })
+        if validTags != self.tagsFilter {
+            self.tagsFilter = validTags
+        }
         TagParser.updateShared(with: tags)
 
-        // Fetch reminder data with validated filters
-        self.filteredCalendarReminderLists =
-            await RemindersService.shared.getReminders(of: self.calendarIdentifiersFilter)
-        self.upcomingReminders = await getUpcomingReminders()
-        self.filteredTagReminderLists = await getTagReminders()
+        let scope = requiredIncompleteScope()
+        incompleteReminders = await RemindersService.shared.fetchIncompleteReminders(
+            calendarIdentifiers: scope.identifiers
+        )
+        incompleteSnapshotScope = scope
+        applyIncompleteSnapshot()
 
-        // Update menu bar
-        self.updateMenuBarCount(to: await getMenuBarCount())
-        await self.refreshPreview()
-
-        // Update search data
         if showingRecentReminders {
-            self.recentReminders = await fetchRecentReminders()
+            self.recentReminders = RemindersService.shared.recentReminderItems(from: allReminders)
+        }
+        if showingSearch {
+            self.searchDocuments = RemindersService.shared.makeSearchDocuments(from: allReminders)
         }
     }
-    
-    private func getUpcomingReminders() async -> [ReminderItem] {
-        let calendarFilter = UserPreferences.shared.filterUpcomingRemindersByCalendar
-            ? self.calendarIdentifiersFilter
-            : nil
 
-        return await RemindersService.shared.getUpcomingReminders(
-            UserPreferences.shared.upcomingRemindersInterval,
-            for: calendarFilter
-        )
-    }
-
-    private func getTagReminders() async -> [TagReminderList] {
-        guard !tagsFilter.isEmpty else { return [] }
-
-        let calendarFilter = UserPreferences.shared.filterTagRemindersByCalendar
-            ? self.calendarIdentifiersFilter
-            : nil
-
-        return await RemindersService.shared.getReminders(
-            byTags: self.tagsFilter,
-            calendarIdentifiers: calendarFilter
-        )
+    private func resortLoadedReminders() {
+        filteredCalendarReminderLists = filteredCalendarReminderLists.map { list in
+            CalendarReminderList(
+                for: list.calendar,
+                with: list.reminders.map { $0.resorted() }
+            )
+        }
+        filteredTagReminderLists = filteredTagReminderLists.map { list in
+            TagReminderList(
+                for: list.tag,
+                with: list.reminders.map { $0.resorted() }
+            )
+        }
     }
 
     private func fetchRecentReminders() async -> [ReminderItem] {
         return await RemindersService.shared.getRecentReminders()
     }
 
-    private func getMenuBarCount() async -> Int {
-        let calendarFilter = UserPreferences.shared.filterMenuBarContentByCalendar
-            ? self.calendarIdentifiersFilter
-            : nil
+    private func reloadDerivedReminders() async {
+        if isUpdating {
+            updateRequestedWhileBusy = true
+            return
+        }
 
-        switch UserPreferences.shared.menuBarCounterType {
-        case .due:
-            return await RemindersService.shared.getUpcomingReminders(.due, for: calendarFilter).count
-        case .today:
-            return await RemindersService.shared.getUpcomingReminders(.today, for: calendarFilter).count
-        case .allReminders:
-            // getUpcomingReminders only returns dated reminders.
-            // `.allReminders` must include reminders with no due date.
-            return await RemindersService.shared.getAllIncompleteRemindersCount(for: calendarFilter)
+        let neededScope = requiredIncompleteScope()
+        if let incompleteSnapshotScope, incompleteSnapshotScope.covers(neededScope) {
+            applyIncompleteSnapshot()
+            return
+        }
+
+        incompleteReminders = await RemindersService.shared.fetchIncompleteReminders(
+            calendarIdentifiers: neededScope.identifiers
+        )
+        incompleteSnapshotScope = neededScope
+        applyIncompleteSnapshot()
+    }
+
+    private func requiredIncompleteScope() -> IncompleteCalendarScope {
+        let preferences = UserPreferences.shared
+        var needsAllCalendars = !preferences.filterUpcomingRemindersByCalendar
+
+        if !preferences.filterTagRemindersByCalendar && !tagsFilter.isEmpty {
+            needsAllCalendars = true
+        }
+
+        let menuBarNeedsReminders = preferences.menuBarCounterType != .disabled
+            || preferences.menuBarReminderPreviewEnabled
+        if menuBarNeedsReminders && !preferences.filterMenuBarContentByCalendar {
+            needsAllCalendars = true
+        }
+
+        if needsAllCalendars {
+            return .all
+        }
+        return .calendars(Set(calendarIdentifiersFilter))
+    }
+
+    private func applyIncompleteSnapshot() {
+        let service = RemindersService.shared
+        let preferences = UserPreferences.shared
+        let upcomingFilter = preferences.filterUpcomingRemindersByCalendar ? calendarIdentifiersFilter : nil
+        let menuBarFilter = preferences.filterMenuBarContentByCalendar ? calendarIdentifiersFilter : nil
+
+        filteredCalendarReminderLists = service.calendarReminderLists(
+            from: incompleteReminders,
+            calendarIdentifiers: calendarIdentifiersFilter
+        )
+
+        let upcoming = service.upcomingReminderItems(
+            from: incompleteReminders,
+            interval: preferences.upcomingRemindersInterval,
+            calendarIdentifiers: upcomingFilter
+        )
+        upcomingReminders = upcoming
+
+        let tagFilter = preferences.filterTagRemindersByCalendar ? calendarIdentifiersFilter : nil
+        filteredTagReminderLists = service.tagReminderLists(
+            from: incompleteReminders,
+            tags: tagsFilter,
+            calendarIdentifiers: tagFilter
+        )
+
+        updateMenuBarCount(to: menuBarCount(
+            from: incompleteReminders,
+            upcoming: upcoming,
+            upcomingFilter: upcomingFilter,
+            menuBarFilter: menuBarFilter,
+            preferences: preferences
+        ))
+        refreshPreview(upcoming: upcoming, upcomingFilter: upcomingFilter, menuBarFilter: menuBarFilter)
+    }
+
+    private func menuBarCount(
+        from reminders: [EKReminder],
+        upcoming: [ReminderItem],
+        upcomingFilter: [String]?,
+        menuBarFilter: [String]?,
+        preferences: UserPreferences
+    ) -> Int {
+        switch preferences.menuBarCounterType {
         case .disabled:
             return -1
+        case .allReminders:
+            // Upcoming items are dated only. `.allReminders` includes reminders with no due date.
+            return RemindersService.shared.incompleteCount(from: reminders, calendarIdentifiers: menuBarFilter)
+        case .due:
+            return upcomingCount(
+                matching: .due,
+                upcoming: upcoming,
+                upcomingFilter: upcomingFilter,
+                menuBarFilter: menuBarFilter,
+                preferences: preferences
+            )
+        case .today:
+            return upcomingCount(
+                matching: .today,
+                upcoming: upcoming,
+                upcomingFilter: upcomingFilter,
+                menuBarFilter: menuBarFilter,
+                preferences: preferences
+            )
         }
+    }
+
+    private func upcomingCount(
+        matching interval: ReminderInterval,
+        upcoming: [ReminderItem],
+        upcomingFilter: [String]?,
+        menuBarFilter: [String]?,
+        preferences: UserPreferences
+    ) -> Int {
+        if interval == preferences.upcomingRemindersInterval && menuBarFilter == upcomingFilter {
+            return upcoming.count
+        }
+        return RemindersService.shared.upcomingReminderItems(
+            from: incompleteReminders,
+            interval: interval,
+            calendarIdentifiers: menuBarFilter
+        ).count
     }
 
     private func updateMenuBarCount(to count: Int) {
         AppDelegate.shared.updateMenuBarCount(to: count)
     }
 
-    private func refreshPreview() async {
-        let calendarFilter = UserPreferences.shared.filterMenuBarContentByCalendar
-            ? calendarIdentifiersFilter
-            : nil
-        await previewService.refresh(calendarFilter: calendarFilter)
+    private func refreshPreview(
+        upcoming: [ReminderItem],
+        upcomingFilter: [String]?,
+        menuBarFilter: [String]?
+    ) {
+        guard UserPreferences.shared.menuBarReminderPreviewEnabled else {
+            previewService.refresh(with: [])
+            return
+        }
+
+        if UserPreferences.shared.upcomingRemindersInterval == .week && menuBarFilter == upcomingFilter {
+            previewService.refresh(with: upcoming)
+            return
+        }
+
+        let weekReminders = RemindersService.shared.upcomingReminderItems(
+            from: incompleteReminders,
+            interval: .week,
+            calendarIdentifiers: menuBarFilter
+        )
+        previewService.refresh(with: weekReminders)
     }
 
     func optimisticallyRemove(reminderItem: ReminderItem) {
         let idsToRemove = Set([reminderItem.id] + reminderItem.childReminders.map(\.id))
+        incompleteReminders.removeAll { idsToRemove.contains($0.calendarItemIdentifier) }
 
         filteredCalendarReminderLists = filteredCalendarReminderLists.map { list in
             let filtered = list.reminders.filter { !idsToRemove.contains($0.id) }
@@ -374,5 +535,30 @@ class RemindersData: ObservableObject {
         }
 
         upcomingReminders = upcomingReminders.filter { !idsToRemove.contains($0.id) }
+    }
+}
+
+private enum IncompleteCalendarScope: Equatable {
+    case all
+    case calendars(Set<String>)
+
+    var identifiers: [String]? {
+        switch self {
+        case .all:
+            return nil
+        case .calendars(let identifiers):
+            return Array(identifiers)
+        }
+    }
+
+    func covers(_ needed: IncompleteCalendarScope) -> Bool {
+        switch (self, needed) {
+        case (.all, _):
+            return true
+        case (.calendars(let loaded), .calendars(let needed)):
+            return needed.isSubset(of: loaded)
+        case (.calendars, .all):
+            return false
+        }
     }
 }

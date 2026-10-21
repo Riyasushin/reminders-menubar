@@ -240,8 +240,26 @@ private func rmbCurrentLocale() -> Locale {
     return Locale(identifier: preferredLanguage)
 }
 
+private enum LocalizedBundleCache {
+    case empty
+    case resolved(language: String?, bundle: Bundle)
+}
+
+private var localizedBundleCache: LocalizedBundleCache = .empty
+
 private func rmbLocalizedBundle() -> Bundle {
-    guard let preferredLanguage = UserPreferences.shared.preferredLanguage,
+    let preferredLanguage = UserPreferences.shared.preferredLanguage
+    if case .resolved(let language, let bundle) = localizedBundleCache, language == preferredLanguage {
+        return bundle
+    }
+
+    let bundle = resolveLocalizedBundle(preferredLanguage: preferredLanguage)
+    localizedBundleCache = .resolved(language: preferredLanguage, bundle: bundle)
+    return bundle
+}
+
+private func resolveLocalizedBundle(preferredLanguage: String?) -> Bundle {
+    guard let preferredLanguage,
           let localizedPath = Bundle.main.path(forResource: preferredLanguage, ofType: "lproj"),
           let localizedBundle = Bundle(path: localizedPath) else {
         return Bundle.main

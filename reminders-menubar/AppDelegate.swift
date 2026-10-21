@@ -40,6 +40,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var sharedAuthorizationErrorMessage: String?
     private var currentMenuBarCount = 0
     private var currentReminderPreview: String?
+    private var appliedMenuBarIcon: RmbIcon?
+    private var appliedMenuBarIconHidden: Bool?
 
     let popover = NSPopover()
     lazy var statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -120,7 +122,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func loadMenuBarIcon() {
         let isContentVisible = currentMenuBarCount > 0 || currentReminderPreview != nil
         let shouldHideIcon = UserPreferences.shared.hideMenuBarIconWhenContentIsShown && isContentVisible
-        statusBarItem.button?.image = shouldHideIcon ? nil : UserPreferences.shared.reminderMenuBarIcon.image
+        let icon = UserPreferences.shared.reminderMenuBarIcon
+        if appliedMenuBarIconHidden == shouldHideIcon && appliedMenuBarIcon == icon {
+            return
+        }
+
+        appliedMenuBarIconHidden = shouldHideIcon
+        appliedMenuBarIcon = icon
+        statusBarItem.button?.image = shouldHideIcon ? nil : icon.image
     }
     
     private func configureMenuBarButton() {

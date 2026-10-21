@@ -1,5 +1,14 @@
 import EventKit
 
+struct ReminderSearchDocument {
+    let reminder: EKReminder
+    let title: String
+    let notes: String
+    let urlString: String
+    let tagNames: [String]
+    let isCompleted: Bool
+}
+
 @MainActor
 class RemindersService {
     static let shared = RemindersService()
@@ -72,87 +81,71 @@ class RemindersService {
         return reminderItems
     }
 
-    func getReminders(of calendarIdentifiers: [String]) async -> [CalendarReminderList] {
-        let calendars = getCalendars().filter({ calendarIdentifiers.contains($0.calendarIdentifier) })
+    /// nil searches every reminder calendar. An empty list searches none.
+    func fetchIncompleteReminders(calendarIdentifiers: [String]?) async -> [EKReminder] {
+        let calendars = incompleteCalendars(for: calendarIdentifiers)
+        if let calendars, calendars.isEmpty {
+            return []
+        }
+
         let predicate = eventStore.predicateForIncompleteReminders(
             withDueDateStarting: nil,
             ending: nil,
             calendars: calendars
         )
-        let remindersByCalendar = Dictionary(
-            grouping: await fetchReminders(matching: predicate),
-            by: { $0.calendar.calendarIdentifier }
-        )
+        return await fetchReminders(matching: predicate)
+    }
 
-        var calendarReminderLists: [CalendarReminderList] = []
-        for calendar in calendars {
+    func calendarReminderLists(
+        from reminders: [EKReminder],
+        calendarIdentifiers: [String]
+    ) -> [CalendarReminderList] {
+        let calendars = getCalendars().filter({ calendarIdentifiers.contains($0.calendarIdentifier) })
+        let remindersByCalendar = Dictionary(grouping: reminders, by: { $0.calendar.calendarIdentifier })
+
+        return calendars.map { calendar in
             let calendarReminders = remindersByCalendar[calendar.calendarIdentifier, default: []]
             let reminderItems = createReminderItems(for: calendarReminders)
-            calendarReminderLists.append(CalendarReminderList(for: calendar, with: reminderItems))
+            return CalendarReminderList(for: calendar, with: reminderItems)
         }
-        
-        return calendarReminderLists
     }
 
     func getRecentReminders() async -> [ReminderItem] {
+        let allReminders = await fetchAllReminders()
+        return recentReminderItems(from: allReminders)
+    }
+
+    func recentReminderItems(from reminders: [EKReminder], now: Date = Date()) -> [ReminderItem] {
         let recentRemindersDayCount = 90
-        let predicate = eventStore.predicateForReminders(in: nil)
         let cutoffDate = Calendar.current.date(
             byAdding: .day,
             value: -recentRemindersDayCount,
-            to: Date()
+            to: now
         ) ?? Date.distantPast
 
-        let allReminders = await fetchReminders(matching: predicate)
-        let recentReminders = allReminders
+        return reminders
             .filter { ($0.lastModifiedDate ?? .distantPast) >= cutoffDate }
-
-        return recentReminders
             .map { ReminderItem(for: $0) }
             .sorted { ($0.lastModifiedDate ?? .distantPast) > ($1.lastModifiedDate ?? .distantPast) }
     }
-    
-    func getUpcomingReminders(
-        _ interval: ReminderInterval,
-        for calendarIdentifiers: [String]? = nil
-    ) async -> [ReminderItem] {
-        var calendars: [EKCalendar]?
-        if let calendarIdentifiers {
-            if calendarIdentifiers.isEmpty {
-                // If the filter does not have any calendar selected, return empty
-                return []
-            }
-            calendars = getCalendars().filter({ calendarIdentifiers.contains($0.calendarIdentifier) })
-        }
-        let predicate = eventStore.predicateForIncompleteReminders(
-            withDueDateStarting: nil,
-            ending: interval.endingDate,
-            calendars: calendars
-        )
-        var reminders = await fetchReminders(matching: predicate).map({ ReminderItem(for: $0) })
+
+    func upcomingReminderItems(
+        from reminders: [EKReminder],
+        interval: ReminderInterval,
+        calendarIdentifiers: [String]?
+    ) -> [ReminderItem] {
+        var matched = remindersLimited(reminders, to: calendarIdentifiers)
+            .filter { matchesUpcomingInterval($0, ending: interval.endingDate) }
         if interval == .due {
             // For the 'due' interval, we should filter reminders for today with no time.
             // These will only be considered due/expired on the following day.
-            reminders = reminders.filter { $0.reminder.isExpired }
+            matched = matched.filter(\.isExpired)
         }
-        return reminders.sortedUpcomingReminders
+        return matched.map({ ReminderItem(for: $0) }).sortedUpcomingReminders
     }
 
-    func getAllIncompleteRemindersCount(for calendarIdentifiers: [String]? = nil) async -> Int {
-        var calendars: [EKCalendar]?
-        if let calendarIdentifiers {
-            if calendarIdentifiers.isEmpty {
-                // If the filter does not have any calendar selected, return 0
-                return 0
-            }
-            calendars = getCalendars().filter({ calendarIdentifiers.contains($0.calendarIdentifier) })
-        }
-        let predicate = eventStore.predicateForIncompleteReminders(
-            withDueDateStarting: nil,
-            ending: nil,
-            calendars: calendars
-        )
-        return await fetchReminders(matching: predicate).count
+    func incompleteCount(from reminders: [EKReminder], calendarIdentifiers: [String]?) -> Int {
+        remindersLimited(reminders, to: calendarIdentifiers).count
     }
     
     func save(reminder: EKReminder) {
@@ -189,10 +182,9 @@ class RemindersService {
         return await fetchReminders(matching: predicate)
     }
 
-    func getAllTags() async -> [Tag] {
-        let allReminders = await fetchAllReminders()
+    func tags(in reminders: [EKReminder]) -> [Tag] {
         var tags: Set<Tag> = []
-        for reminder in allReminders {
+        for reminder in reminders {
             for tag in reminder.ekTags {
                 tags.insert(tag)
             }
@@ -200,10 +192,13 @@ class RemindersService {
         return tags.sorted()
     }
 
-    func getReminders(byTags tags: [Tag], calendarIdentifiers: [String]?) async -> [TagReminderList] {
+    func tagReminderLists(
+        from reminders: [EKReminder],
+        tags: [Tag],
+        calendarIdentifiers: [String]?
+    ) -> [TagReminderList] {
         guard !tags.isEmpty else { return [] }
 
-        var calendars: [EKCalendar]?
         if let calendarIdentifiers {
             let selectedCalendars = getCalendars().filter {
                 calendarIdentifiers.contains($0.calendarIdentifier)
@@ -211,47 +206,82 @@ class RemindersService {
             guard !selectedCalendars.isEmpty else {
                 return tags.map { TagReminderList(for: $0, with: []) }
             }
-            calendars = selectedCalendars
         }
 
-        let predicate = eventStore.predicateForIncompleteReminders(
-            withDueDateStarting: nil,
-            ending: nil,
-            calendars: calendars
-        )
-        let allReminders = await fetchReminders(matching: predicate)
-
-        var tagReminderLists: [TagReminderList] = []
-
-        for tag in tags {
-            let matchingReminders = allReminders.filter { reminder in
-                reminder.ekTags.contains(tag)
+        let scopedReminders = remindersLimited(reminders, to: calendarIdentifiers)
+        let selectedTags = Set(tags)
+        var remindersByTag: [Tag: [EKReminder]] = [:]
+        for reminder in scopedReminders {
+            for tag in reminder.ekTags where selectedTags.contains(tag) {
+                remindersByTag[tag, default: []].append(reminder)
             }
-            let reminderItems = createReminderItems(for: matchingReminders)
-            tagReminderLists.append(TagReminderList(for: tag, with: reminderItems))
         }
 
-        return tagReminderLists
+        return tags.map { tag in
+            let reminderItems = createReminderItems(for: remindersByTag[tag, default: []])
+            return TagReminderList(for: tag, with: reminderItems)
+        }
     }
 
-    func searchReminders(matching query: String, in allReminders: [EKReminder]) -> [ReminderItem] {
+    private func incompleteCalendars(for calendarIdentifiers: [String]?) -> [EKCalendar]? {
+        guard let calendarIdentifiers else {
+            return nil
+        }
+        return getCalendars().filter({ calendarIdentifiers.contains($0.calendarIdentifier) })
+    }
+
+    private func remindersLimited(
+        _ reminders: [EKReminder],
+        to calendarIdentifiers: [String]?
+    ) -> [EKReminder] {
+        guard let calendarIdentifiers else {
+            return reminders
+        }
+        if calendarIdentifiers.isEmpty {
+            return []
+        }
+        let allowedIdentifiers = Set(calendarIdentifiers)
+        return reminders.filter({ allowedIdentifiers.contains($0.calendar.calendarIdentifier) })
+    }
+
+    // EventKit includes a dated reminder when its due date is on or before `ending`.
+    // A nil ending is unbounded and also includes reminders with no due date.
+    private func matchesUpcomingInterval(_ reminder: EKReminder, ending: Date?) -> Bool {
+        guard let ending else {
+            return true
+        }
+        guard let dueDate = reminder.dueDateComponents?.date else {
+            return false
+        }
+        return dueDate <= ending
+    }
+
+    func makeSearchDocuments(from reminders: [EKReminder]) -> [ReminderSearchDocument] {
+        reminders.map { reminder in
+            ReminderSearchDocument(
+                reminder: reminder,
+                title: (reminder.title ?? "").lowercased(),
+                notes: (reminder.notes ?? "").lowercased(),
+                urlString: reminder.attachedUrl?.absoluteString.lowercased() ?? "",
+                tagNames: reminder.ekTags.map({ $0.name.lowercased() }),
+                isCompleted: reminder.isCompleted
+            )
+        }
+    }
+
+    func searchReminders(matching query: String, in documents: [ReminderSearchDocument]) -> [ReminderItem] {
         let queryWords = query
             .lowercased()
             .split(separator: " ")
             .map { (word: String($0), tagWord: $0.hasPrefix("#") ? String($0.dropFirst()) : nil) }
         guard !queryWords.isEmpty else { return [] }
 
-        let scored: [(ReminderItem, Int)] = allReminders.compactMap { reminder in
-            let title = (reminder.title ?? "").lowercased()
-            let notes = (reminder.notes ?? "").lowercased()
-            let urlString = reminder.attachedUrl?.absoluteString.lowercased() ?? ""
-            let tagNames = reminder.ekTags.map({ $0.name.lowercased() })
-
-            let allFields = [title, notes, urlString] + tagNames
+        let scored: [(ReminderItem, Int)] = documents.compactMap { document in
+            let allFields = [document.title, document.notes, document.urlString] + document.tagNames
 
             let allWordsMatch = queryWords.allSatisfy { word, tagWord in
                 if let tagWord, !tagWord.isEmpty,
-                   tagNames.contains(where: { $0.contains(tagWord) }) {
+                   document.tagNames.contains(where: { $0.contains(tagWord) }) {
                     return true
                 }
                 return allFields.contains { $0.contains(word) }
@@ -260,14 +290,14 @@ class RemindersService {
 
             var score = 0
             for (word, tagWord) in queryWords {
-                if title.contains(word) { score += 3 }
-                if notes.contains(word) { score += 2 }
-                if tagNames.contains(where: { $0.contains(tagWord ?? word) }) { score += 2 }
-                if urlString.contains(word) { score += 1 }
+                if document.title.contains(word) { score += 3 }
+                if document.notes.contains(word) { score += 2 }
+                if document.tagNames.contains(where: { $0.contains(tagWord ?? word) }) { score += 2 }
+                if document.urlString.contains(word) { score += 1 }
             }
-            if !reminder.isCompleted { score += 1 }
+            if !document.isCompleted { score += 1 }
 
-            return (ReminderItem(for: reminder), score)
+            return (ReminderItem(for: document.reminder), score)
         }
 
         return scored
