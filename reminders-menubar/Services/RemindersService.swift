@@ -1,5 +1,14 @@
 import EventKit
 
+struct ReminderSearchDocument {
+    let reminder: EKReminder
+    let title: String
+    let notes: String
+    let urlString: String
+    let tagNames: [String]
+    let isCompleted: Bool
+}
+
 @MainActor
 class RemindersService {
     static let shared = RemindersService()
@@ -247,24 +256,32 @@ class RemindersService {
         return dueDate <= ending
     }
 
-    func searchReminders(matching query: String, in allReminders: [EKReminder]) -> [ReminderItem] {
+    func makeSearchDocuments(from reminders: [EKReminder]) -> [ReminderSearchDocument] {
+        reminders.map { reminder in
+            ReminderSearchDocument(
+                reminder: reminder,
+                title: (reminder.title ?? "").lowercased(),
+                notes: (reminder.notes ?? "").lowercased(),
+                urlString: reminder.attachedUrl?.absoluteString.lowercased() ?? "",
+                tagNames: reminder.ekTags.map({ $0.name.lowercased() }),
+                isCompleted: reminder.isCompleted
+            )
+        }
+    }
+
+    func searchReminders(matching query: String, in documents: [ReminderSearchDocument]) -> [ReminderItem] {
         let queryWords = query
             .lowercased()
             .split(separator: " ")
             .map { (word: String($0), tagWord: $0.hasPrefix("#") ? String($0.dropFirst()) : nil) }
         guard !queryWords.isEmpty else { return [] }
 
-        let scored: [(ReminderItem, Int)] = allReminders.compactMap { reminder in
-            let title = (reminder.title ?? "").lowercased()
-            let notes = (reminder.notes ?? "").lowercased()
-            let urlString = reminder.attachedUrl?.absoluteString.lowercased() ?? ""
-            let tagNames = reminder.ekTags.map({ $0.name.lowercased() })
-
-            let allFields = [title, notes, urlString] + tagNames
+        let scored: [(ReminderItem, Int)] = documents.compactMap { document in
+            let allFields = [document.title, document.notes, document.urlString] + document.tagNames
 
             let allWordsMatch = queryWords.allSatisfy { word, tagWord in
                 if let tagWord, !tagWord.isEmpty,
-                   tagNames.contains(where: { $0.contains(tagWord) }) {
+                   document.tagNames.contains(where: { $0.contains(tagWord) }) {
                     return true
                 }
                 return allFields.contains { $0.contains(word) }
@@ -273,14 +290,14 @@ class RemindersService {
 
             var score = 0
             for (word, tagWord) in queryWords {
-                if title.contains(word) { score += 3 }
-                if notes.contains(word) { score += 2 }
-                if tagNames.contains(where: { $0.contains(tagWord ?? word) }) { score += 2 }
-                if urlString.contains(word) { score += 1 }
+                if document.title.contains(word) { score += 3 }
+                if document.notes.contains(word) { score += 2 }
+                if document.tagNames.contains(where: { $0.contains(tagWord ?? word) }) { score += 2 }
+                if document.urlString.contains(word) { score += 1 }
             }
-            if !reminder.isCompleted { score += 1 }
+            if !document.isCompleted { score += 1 }
 
-            return (ReminderItem(for: reminder), score)
+            return (ReminderItem(for: document.reminder), score)
         }
 
         return scored

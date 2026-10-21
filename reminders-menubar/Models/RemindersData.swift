@@ -120,16 +120,16 @@ class RemindersData: ObservableObject {
         $searchText
             .dropFirst()
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
-            .combineLatest($searchableReminders)
-            .sink { [weak self] query, cached in
+            .combineLatest($searchDocuments)
+            .sink { [weak self] query, documents in
                 guard let self else { return }
-                guard showingSearch, !query.isEmpty, let cached else {
+                guard showingSearch, !query.isEmpty, let documents else {
                     searchResults = nil
                     return
                 }
                 searchResults = RemindersService.shared.searchReminders(
                     matching: query,
-                    in: cached
+                    in: documents
                 )
             }
             .store(in: &cancellationTokens)
@@ -241,12 +241,13 @@ class RemindersData: ObservableObject {
             if showingSearch {
                 showingRecentReminders = false
                 Task {
-                    self.searchableReminders = await RemindersService.shared.fetchAllReminders()
+                    let reminders = await RemindersService.shared.fetchAllReminders()
+                    self.searchDocuments = RemindersService.shared.makeSearchDocuments(from: reminders)
                 }
             } else {
                 searchText = ""
                 searchResults = nil
-                searchableReminders = nil
+                searchDocuments = nil
             }
         }
     }
@@ -255,7 +256,7 @@ class RemindersData: ObservableObject {
 
     @Published var searchResults: [ReminderItem]?
 
-    @Published private var searchableReminders: [EKReminder]?
+    @Published private var searchDocuments: [ReminderSearchDocument]?
 
     @Published var calendarIdentifiersFilter: [String] = {
         guard let identifiers = UserPreferences.shared.preferredCalendarIdentifiersFilter else {
@@ -346,7 +347,7 @@ class RemindersData: ObservableObject {
             self.recentReminders = RemindersService.shared.recentReminderItems(from: allReminders)
         }
         if showingSearch {
-            self.searchableReminders = allReminders
+            self.searchDocuments = RemindersService.shared.makeSearchDocuments(from: allReminders)
         }
     }
 
