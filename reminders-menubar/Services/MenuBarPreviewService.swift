@@ -30,7 +30,7 @@ class MenuBarPreviewService {
         .store(in: &cancellationTokens)
     }
 
-    func refresh(calendarFilter: [String]?) async {
+    func refresh(with reminders: [ReminderItem]) {
         guard UserPreferences.shared.menuBarReminderPreviewEnabled else {
             cachedReminders = []
             stopTimer()
@@ -38,7 +38,7 @@ class MenuBarPreviewService {
             return
         }
 
-        cachedReminders = await RemindersService.shared.getUpcomingReminders(.week, for: calendarFilter)
+        cachedReminders = reminders
         recompute()
     }
 
