@@ -42,16 +42,23 @@ class RemindersData: ObservableObject {
         Publishers.MergeMany(
             UserPreferences.shared.$showRemindersWithDueDateOnTop.map { _ in }.eraseToAnyPublisher(),
             UserPreferences.shared.$sortRemindersByFlagAndPriority.map { _ in }.eraseToAnyPublisher(),
-            UserPreferences.shared.$reminderSortingOrder.map { _ in }.eraseToAnyPublisher(),
-            $calendarIdentifiersFilter.removeDuplicates().map { _ in }.eraseToAnyPublisher()
+            UserPreferences.shared.$reminderSortingOrder.map { _ in }.eraseToAnyPublisher()
         )
         .dropFirst()
         .sink { [weak self] _ in
-            Task {
-                await self?.update()
-            }
+            self?.resortLoadedReminders()
         }
         .store(in: &cancellationTokens)
+
+        $calendarIdentifiersFilter
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task {
+                    await self?.update()
+                }
+            }
+            .store(in: &cancellationTokens)
     }
 
     private func addUpcomingObservers() {
@@ -322,6 +329,21 @@ class RemindersData: ObservableObject {
         }
         if showingSearch {
             self.searchableReminders = allReminders
+        }
+    }
+
+    private func resortLoadedReminders() {
+        filteredCalendarReminderLists = filteredCalendarReminderLists.map { list in
+            CalendarReminderList(
+                for: list.calendar,
+                with: list.reminders.map { $0.resorted() }
+            )
+        }
+        filteredTagReminderLists = filteredTagReminderLists.map { list in
+            TagReminderList(
+                for: list.tag,
+                with: list.reminders.map { $0.resorted() }
+            )
         }
     }
 

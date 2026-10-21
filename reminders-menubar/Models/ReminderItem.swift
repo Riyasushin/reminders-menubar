@@ -17,6 +17,14 @@ struct ReminderItem: Identifiable, Equatable {
         self.hasChildren = !childReminders.isEmpty
     }
     
+    func resorted() -> ReminderItem {
+        ReminderItem(
+            for: reminder,
+            isChild: isChild,
+            withChildren: childReminders.map { $0.resorted() }
+        )
+    }
+
     static func == (lhs: ReminderItem, rhs: ReminderItem) -> Bool {
         return (
             lhs.id == rhs.id
