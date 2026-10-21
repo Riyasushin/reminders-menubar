@@ -22,6 +22,7 @@ class RemindersData: ObservableObject {
         addTagObservers()
         addMenuBarObservers()
         addSearchObservers()
+        addSectionOrderObservers()
     }
 
     private func addDataObservers() {
@@ -125,40 +126,73 @@ class RemindersData: ObservableObject {
             .store(in: &cancellationTokens)
     }
 
+    private func addSectionOrderObservers() {
+        Publishers.MergeMany(
+            UserPreferences.shared.$showTagsBeforeCalendars.map { _ in }.eraseToAnyPublisher(),
+            UserPreferences.shared.$showUpcomingReminders.map { _ in }.eraseToAnyPublisher(),
+            UserPreferences.shared.$hideUpcomingRemindersFromLists.map { _ in }.eraseToAnyPublisher()
+        )
+        .dropFirst()
+        .sink { [weak self] _ in
+            self?.cachedOrderedSections = nil
+        }
+        .store(in: &cancellationTokens)
+    }
+
     @Published var availableCalendars: [EKCalendar] = []
 
     @Published var availableTags: [Tag] = []
 
-    @Published var upcomingReminders: [ReminderItem] = []
+    @Published var upcomingReminders: [ReminderItem] = [] {
+        didSet { cachedOrderedSections = nil }
+    }
 
-    @Published private var filteredCalendarReminderLists: [CalendarReminderList] = []
+    @Published private var filteredCalendarReminderLists: [CalendarReminderList] = [] {
+        didSet { cachedOrderedSections = nil }
+    }
 
-    @Published private var filteredTagReminderLists: [TagReminderList] = []
+    @Published private var filteredTagReminderLists: [TagReminderList] = [] {
+        didSet { cachedOrderedSections = nil }
+    }
+
+    private var cachedOrderedSections: [ReminderListSection]?
 
     var orderedFilteredSections: [ReminderListSection] {
+        if let cachedOrderedSections {
+            return cachedOrderedSections
+        }
+        let sections = makeOrderedFilteredSections()
+        cachedOrderedSections = sections
+        return sections
+    }
+
+    private func makeOrderedFilteredSections() -> [ReminderListSection] {
         let reminderIdsToExclude = upcomingReminderIdsToExcludeFromLists
-        let calendarSections = filteredCalendarReminderLists.map {
+        let preservesOrder = reminderIdsToExclude.isEmpty
+        let calendarSections = filteredCalendarReminderLists.map { list in
             let exclusionResult = ReminderItemTree.excluding(
                 reminderIds: reminderIdsToExclude,
-                from: $0.reminders
+                from: list.reminders
             )
             return ReminderListSection.calendar(
                 CalendarReminderList(
-                    for: $0.calendar,
-                    with: exclusionResult.reminders
+                    for: list.calendar,
+                    with: exclusionResult.reminders,
+                    preservesOrder: preservesOrder
                 ),
                 hiddenUpcomingReminderCount: exclusionResult.excludedCount
             )
         }
-        let tagSections = filteredTagReminderLists.map {
+        let tagSections = filteredTagReminderLists.map { list in
             let exclusionResult = ReminderItemTree.excluding(
                 reminderIds: reminderIdsToExclude,
-                from: $0.reminders
+                from: list.reminders
             )
             return ReminderListSection.tag(
                 TagReminderList(
-                    for: $0.tag,
-                    with: exclusionResult.reminders
+                    for: list.tag,
+                    with: exclusionResult.reminders,
+                    preservesOrder: preservesOrder
                 ),
                 hiddenUpcomingReminderCount: exclusionResult.excludedCount
             )

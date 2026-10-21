@@ -5,9 +5,9 @@ struct CalendarReminderList: Identifiable, Equatable {
     let calendar: EKCalendar
     let reminders: [ReminderItem]
     
-    init(for calendar: EKCalendar, with reminderItems: [ReminderItem]) {
+    init(for calendar: EKCalendar, with reminderItems: [ReminderItem], preservesOrder: Bool = false) {
         self.id = calendar.calendarIdentifier
         self.calendar = calendar
-        self.reminders = reminderItems.sortedReminders
+        self.reminders = preservesOrder ? reminderItems : reminderItems.sortedReminders
     }
 }

@@ -5,8 +5,8 @@ struct TagReminderList: Identifiable, Equatable {
     let tag: Tag
     let reminders: [ReminderItem]
 
-    init(for tag: Tag, with reminderItems: [ReminderItem]) {
+    init(for tag: Tag, with reminderItems: [ReminderItem], preservesOrder: Bool = false) {
         self.tag = tag
-        self.reminders = reminderItems.sortedReminders
+        self.reminders = preservesOrder ? reminderItems : reminderItems.sortedReminders
     }
 }
