@@ -68,26 +68,12 @@ extension Date {
     }
 
     private func dateDescription(withTime showTimeDescription: Bool, relativeFormatting: Bool) -> String {
-        let locale = rmbTimeFormattedLocale()
-        let dateFormatter = DateFormatter()
-
-        dateFormatter.dateStyle = .medium
-        dateFormatter.timeStyle = .none
-        dateFormatter.locale = locale
-        dateFormatter.doesRelativeDateFormatting = relativeFormatting
-        let dateString = dateFormatter.string(from: self)
-
-        guard showTimeDescription else {
-            return dateString
-        }
-
-        dateFormatter.doesRelativeDateFormatting = false
-        dateFormatter.dateStyle = .none
-        // NOTE: "jm" adapts hour format (12h/24h) to the locale's hour cycle preference
-        dateFormatter.dateFormat = DateFormatter.dateFormat(fromTemplate: "jm", options: 0, locale: locale)
-        let timeString = dateFormatter.string(from: self)
-
-        return "\(dateString), \(timeString)"
+        DateDescriptionCache.string(
+            from: self,
+            showTime: showTimeDescription,
+            relativeFormatting: relativeFormatting,
+            locale: rmbTimeFormattedLocale()
+        )
     }
     
     func dateComponents(withTime: Bool) -> DateComponents {
@@ -96,5 +82,120 @@ extension Date {
             components.formUnion([.timeZone, .hour, .minute, .second])
         }
         return Calendar.current.dateComponents(components, from: self)
+    }
+}
+
+// DateFormatter is expensive to create and to configure from a locale template.
+// Reminder rows call this on every SwiftUI body pass, so formatters are reused.
+private enum DateDescriptionCache {
+    private struct Key: Hashable {
+        let localeIdentifier: String
+        let timeZoneIdentifier: String
+        let calendarIdentifier: String
+        let relativeFormatting: Bool
+        let includesTime: Bool
+    }
+
+    private struct CachedTimeFormat {
+        let format: String?
+    }
+
+    private static let lock = NSLock()
+    private static var formatters: [Key: DateFormatter] = [:]
+    private static var hourMinuteFormats: [String: CachedTimeFormat] = [:]
+
+    static func string(
+        from date: Date,
+        showTime: Bool,
+        relativeFormatting: Bool,
+        locale: Locale
+    ) -> String {
+        let timeZone = TimeZone.current
+        let calendar = Calendar.current
+        let dateString = lockedString(
+            from: date,
+            locale: locale,
+            timeZone: timeZone,
+            calendar: calendar,
+            relativeFormatting: relativeFormatting,
+            includesTime: false
+        )
+
+        guard showTime else {
+            return dateString
+        }
+
+        let timeString = lockedString(
+            from: date,
+            locale: locale,
+            timeZone: timeZone,
+            calendar: calendar,
+            relativeFormatting: false,
+            includesTime: true
+        )
+        return "\(dateString), \(timeString)"
+    }
+
+    private static func lockedString(
+        from date: Date,
+        locale: Locale,
+        timeZone: TimeZone,
+        calendar: Calendar,
+        relativeFormatting: Bool,
+        includesTime: Bool
+    ) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let key = Key(
+            localeIdentifier: locale.identifier,
+            timeZoneIdentifier: timeZone.identifier,
+            calendarIdentifier: String(describing: calendar.identifier),
+            relativeFormatting: relativeFormatting,
+            includesTime: includesTime
+        )
+        let formatter = formatter(for: key, locale: locale, timeZone: timeZone, calendar: calendar)
+        return formatter.string(from: date)
+    }
+
+    private static func formatter(
+        for key: Key,
+        locale: Locale,
+        timeZone: TimeZone,
+        calendar: Calendar
+    ) -> DateFormatter {
+        if let formatter = formatters[key] {
+            return formatter
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = locale
+        formatter.timeZone = timeZone
+        formatter.calendar = calendar
+
+        if key.includesTime {
+            formatter.dateStyle = .none
+            formatter.timeStyle = .none
+            formatter.doesRelativeDateFormatting = false
+            // NOTE: "jm" adapts hour format (12h/24h) to the locale's hour cycle preference.
+            formatter.dateFormat = hourMinuteFormat(for: locale)
+        } else {
+            formatter.dateStyle = .medium
+            formatter.timeStyle = .none
+            formatter.doesRelativeDateFormatting = key.relativeFormatting
+        }
+
+        formatters[key] = formatter
+        return formatter
+    }
+
+    private static func hourMinuteFormat(for locale: Locale) -> String? {
+        if let cached = hourMinuteFormats[locale.identifier] {
+            return cached.format
+        }
+
+        let format = DateFormatter.dateFormat(fromTemplate: "jm", options: 0, locale: locale)
+        hourMinuteFormats[locale.identifier] = CachedTimeFormat(format: format)
+        return format
     }
 }
