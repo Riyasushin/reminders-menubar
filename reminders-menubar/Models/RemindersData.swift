@@ -8,6 +8,8 @@ class RemindersData: ObservableObject {
     private let previewService = MenuBarPreviewService()
     private var incompleteReminders: [EKReminder] = []
     private var incompleteSnapshotScope: IncompleteCalendarScope?
+    private var isUpdating = false
+    private var updateRequestedWhileBusy = false
 
     init() {
         addObservers()
@@ -296,6 +298,22 @@ class RemindersData: ObservableObject {
     }
 
     func update() async {
+        if isUpdating {
+            updateRequestedWhileBusy = true
+            return
+        }
+
+        isUpdating = true
+        await performUpdate()
+        isUpdating = false
+
+        if updateRequestedWhileBusy {
+            updateRequestedWhileBusy = false
+            await update()
+        }
+    }
+
+    private func performUpdate() async {
         // Validate filter — remove stale calendars that no longer exist
         let calendars = RemindersService.shared.getCalendars()
         let calendarsSet = Set(calendars.map({ $0.calendarIdentifier }))
@@ -352,6 +370,11 @@ class RemindersData: ObservableObject {
     }
 
     private func reloadDerivedReminders() async {
+        if isUpdating {
+            updateRequestedWhileBusy = true
+            return
+        }
+
         let neededScope = requiredIncompleteScope()
         if let incompleteSnapshotScope, incompleteSnapshotScope.covers(neededScope) {
             applyIncompleteSnapshot()
